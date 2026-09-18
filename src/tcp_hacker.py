@@ -104,25 +104,71 @@ def attack_passthrough(pgp_text: str) -> str:
 
 
 # ============================================================
-# KỊCH BẢN 2 — THAY PAYLOAD BẰNG JSON GIẢ
+# KỊCH BẢN 2 — SỬA BYTES TRONG CIPHERTEXT (THẤT BẠI TẠI B.4)
 # ============================================================
 
-def attack_replace_content(pgp_text: str, hacker_message: str) -> str:
+def attack_corrupt_ciphertext(pgp_text: str, hacker_message: str) -> str:
     """
-    Thay toàn bộ base64 body bằng JSON giả.
-    → Bob thất bại ngay tại B.1 vì không parse được cấu trúc PGP.
+    Hacker chỉnh sửa trực tiếp một số bytes trong ciphertext AES.
+    Cấu trúc PGP vẫn nguyên vẹn (B.1 ✔) và session key không bị đụng (→ B.3 ✔),
+    nhưng data sau khi giải mã AES bị hỏng
+    → SHA-1(corrupt_data) ≠ MDC gốc → B.4 ✘ THẤT BẠI.
     """
-    header_block, _ = extract_armor_body(pgp_text)
-    fake_payload = (
-        f'{{"hacked": true, "fake_message": "{hacker_message}", '
-        f'"note": "NOT a valid PGP packet — injected by Hacker!"}}'
-    )
-    fake_b64 = base64.b64encode(fake_payload.encode("utf-8")).decode("ascii")
+    import json as _json
+
+    header_block, body_b64 = extract_armor_body(pgp_text)
+
+    # Xử lý padding base64
+    missing = len(body_b64) % 4
+    if missing:
+        body_b64 += "=" * (4 - missing)
+
+    # Decode base64 → raw JSON text (2 object ghép liền nhau)
+    raw_bytes = base64.b64decode(body_b64)
+    text      = raw_bytes.decode("utf-8")
+
+    # Parse 2 JSON object: SessionKeyPacket + EncryptedDataPacket
+    decoder   = _json.JSONDecoder()
+    pkt1_dict, idx1 = decoder.raw_decode(text, 0)
+    pkt2_dict, _    = decoder.raw_decode(text, idx1)
+
+    # Lấy ciphertext gốc
+    ct_b64       = pkt2_dict["ciphertext"]
+    ct_bytes     = bytearray(base64.b64decode(ct_b64))
+    original_ct  = bytes(ct_bytes)  # lưu để hiển thị
+
+    # XOR 16 bytes ở giữa ciphertext với nội dung hacker muốn gửi
+    corrupt_start = max(16, len(ct_bytes) // 3)  # tránh block đầu
+    inject        = (hacker_message.encode("utf-8") * 2)[:16]  # đảm bảo đủ 16 bytes
+    for i, b in enumerate(inject):
+        if corrupt_start + i < len(ct_bytes):
+            ct_bytes[corrupt_start + i] ^= b  # XOR flip bytes
+
+    pkt2_dict["ciphertext"] = base64.b64encode(bytes(ct_bytes)).decode("ascii")
+
+    # Serialize lại cả 2 packet thành JSON ghép, base64 encode
+    new_text = (_json.dumps(pkt1_dict, separators=(',', ':'))
+                + _json.dumps(pkt2_dict, separators=(',', ':')))
+    new_b64  = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
 
     print()
-    print(f"  [Hacker] Thay body base64 bằng JSON giả: \"{hacker_message}\"")
-    print("  [Hacker] Bob sẽ thất bại tại B.1 — dearmor() không parse được!")
-    return rebuild_pgp(header_block, fake_b64)
+    print("  ╔══════════════════════════════════════════════════════════════╗")
+    print("  ║  [Hacker] Phẫu thuật ciphertext AES ...                    ║")
+    print("  ╚══════════════════════════════════════════════════════════════╝")
+    print()
+    print(f"  Ciphertext gốc (preview) : {original_ct[corrupt_start:corrupt_start+8].hex().upper()}...")
+    print(f"  XOR với bytes            : {inject.hex().upper()}")
+    print(f"  Vị trí bị sửa           : bytes [{corrupt_start}:{corrupt_start+16}] trong ciphertext")
+    print(f"  Ciphertext sau sửa      : {bytes(ct_bytes)[corrupt_start:corrupt_start+8].hex().upper()}...")
+    print()
+    print("  ┌─ Dự đoán kết quả tại Bob ──────────────────────────────────────")
+    print("  │  B.1 ✔ dearmor()        — cấu trúc JSON vẫn nguyên vẹn")
+    print("  │  B.2 ✔ RSA decrypt key  — session key không bị đụng")
+    print("  │  B.3 ✔ AES decrypt      — giải mã được nhưng data bị hỏng")
+    print("  │  B.4 ✘ MDC check        — SHA-1(data hỏng) ≠ MDC gốc → PHÁT HIỆN!")
+    print("  └────────────────────────────────────────────────────────────────")
+
+    return rebuild_pgp(header_block, new_b64)
 
 
 # ============================================================
@@ -261,15 +307,15 @@ def handle_connection(alice_conn: socket.socket, alice_addr,
         if choice == "1":
             print("  ║  Kịch bản 1: CHUYỂN TIẾP NGUYÊN BẢN                       ║")
         elif choice == "2":
-            print("  ║  Kịch bản 2: THAY PAYLOAD BẰNG JSON GIẢ (thất bại B.1)   ║")
+            print("  ║  Kịch bản 2: SỬ A CIPHERTEXT AES  (thất bại tại B.4 MDC) ║")
         else:
-            print("  ║  Kịch bản 3: GIẢ MẠO PGP HOÀN CHỈNH (thất bại B.6)      ║")
+            print("  ║  Kịch bản 3: GIẢ MẠO PGP HOÀN CHỄNH (thất bại tại B.6) ║")
         print("  ╚══════════════════════════════════════════════════════════════╝")
 
         if choice == "1":
             modified_pgp = attack_passthrough(pgp_text)
         elif choice == "2":
-            modified_pgp = attack_replace_content(pgp_text, hacker_message)
+            modified_pgp = attack_corrupt_ciphertext(pgp_text, hacker_message)
         else:
             modified_pgp = attack_forge_full_pgp(hacker_message, bob_pub_key)
 
@@ -329,7 +375,9 @@ def handle_connection(alice_conn: socket.socket, alice_addr,
                 print()
                 print("  ┌─ Kết luận bảo mật ──────────────────────────────────────────")
                 if choice == "2":
-                    print("  │  Hacker thay base64 → sai cấu trúc → Bob phát hiện tại B.1")
+                    print("  │  Hacker sửa bytes trong ciphertext → AES decrypt cho ra data hỏng")
+                    print("  │  SHA-1(data hỏng) ≠ MDC gốc → Bob phát hiện tại B.4")
+                    print("  │  ✅ MDC bảo vệ tính toàn vẹn dữ liệu sau AES decrypt!")
                 elif choice == "3":
                     print("  │  Hacker xây PGP đúng format + đúng key → qua B.1-B.5")
                     print("  │  Nhưng không có alice_private.pem → chữ ký ngẫu nhiên")
@@ -380,12 +428,13 @@ def main():
     while True:
         # ── CHỌN KỊCH BẢN ───────────────────────────────────
         avail = "(1/2/3)" if bob_pub_key else "(1/2)"
-        print("  ┌─ Chọn kịch bản tấn công ───────────────────────────────────────")
-        print("  │  [1] Chuyển tiếp nguyên bản       → Bob THÀNH CÔNG ✔")
-        print("  │  [2] Thay payload bằng JSON giả    → Bob thất bại tại B.1 ✘")
-        print("  │  [3] Giả mạo PGP hoàn chỉnh        → Bob thất bại tại B.6 ✘")
+        print("  ┌─ Chọn kịch bản tấn công ───────────────────────────────────────────────────")
+        print("  │  [1] Chuyển tiếp nguyên bản          → Bob THÀNH CÔNG ✔")
+        print("  │  [2] Sửa bytes trong ciphertext AES  → Bob thất bại tại B.4 ✘")
+        print("  │      (giữ nguyên cấu trúc PGP, không chạm session key)")
+        print("  │  [3] Giả mạo PGP hoàn chỉnh           → Bob thất bại tại B.6 ✘")
         print("  │      (biết format + có bob_public.pem, không có alice_private.pem)")
-        print("  └────────────────────────────────────────────────────────────────")
+        print("  └────────────────────────────────────────────────────────────────────")
 
         valid = ("1", "2", "3") if bob_pub_key else ("1", "2")
         while True:
