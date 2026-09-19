@@ -4,7 +4,8 @@ HACKER — Man-in-the-Middle (MITM) Proxy.
 
 Ba kịch bản tấn công:
   [1] Chuyển tiếp nguyên bản          → Bob thành công (baseline)
-  [2] Thay payload bằng JSON giả       → Bob thất bại tại B.1 (dearmor)
+  [2] Sửa bytes trong ciphertext AES  → Bob thất bại tại B.4 (MDC check)
+      (Giữ nguyên cấu trúc PGP, không chạm session key)
   [3] Giả mạo PGP hoàn chỉnh          → Bob qua B.1-B.5, thất bại tại B.6 (chữ ký)
       (Hacker biết format + có bob_public.pem, nhưng không có alice_private.pem)
 
